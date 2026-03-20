@@ -15,6 +15,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Video
 from astrbot.api.star import Context, Star, register
 
 
@@ -30,6 +31,9 @@ class BaseStorageProvider:
         raise NotImplementedError
 
     def get_file_detail(self, file_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def get_download_url(self, file_id: str) -> dict[str, Any]:
         raise NotImplementedError
 
 
@@ -73,8 +77,8 @@ class S3StorageProvider(BaseStorageProvider):
         try:
             response = client.list_objects_v2(**list_kwargs)
         except Exception as exc:
-            error_code = getattr(getattr(exc, "response", None), "get", lambda *a: None)("Error", {}).get("Code", "")
-            if not error_code and hasattr(exc, "response"):
+            error_code = ""
+            if hasattr(exc, "response"):
                 error_code = (exc.response.get("Error") or {}).get("Code", "")
             if error_code in ("NoSuchKey", "NoSuchBucket"):
                 return []
@@ -90,12 +94,49 @@ class S3StorageProvider(BaseStorageProvider):
     def get_file_detail(self, file_id: str) -> dict[str, Any]:
         client, bucket, _, _, public_base_url = self._build_client_context()
         object_key = self._normalize_file_id(file_id)
+        logger.debug(f"[detail] bucket={bucket} key={object_key}")
         try:
             response = client.head_object(Bucket=bucket, Key=object_key)
         except Exception as exc:
             raise StorageError(f"获取文件详情失败：{exc}") from exc
 
         return self._normalize_head_object(bucket, object_key, response, public_base_url)
+
+    def get_download_url(self, file_id: str) -> dict[str, Any]:
+        client, bucket, _, _, public_base_url = self._build_client_context()
+        object_key = self._normalize_file_id(file_id)
+        logger.debug(f"[download] bucket={bucket} key={object_key}")
+
+        # 优先使用 public_base_url 拼出直链，稳定可靠，不依赖签名
+        if public_base_url:
+            download_url = self._build_file_url(object_key, public_base_url)
+            return {
+                "file_id": object_key,
+                "bucket": bucket,
+                "key": object_key,
+                "download_url": download_url,
+                "url": download_url,
+                "expires_in": None,
+            }
+
+        # 无 public_base_url 时回退预签名 URL
+        try:
+            presigned_url = client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": object_key},
+                ExpiresIn=3600,
+            )
+        except Exception as exc:
+            raise StorageError(f"获取下载链接失败：{exc}") from exc
+
+        return {
+            "file_id": object_key,
+            "bucket": bucket,
+            "key": object_key,
+            "download_url": presigned_url,
+            "url": self._build_file_url(object_key, public_base_url),
+            "expires_in": 3600,
+        }
 
     def _build_client_context(self) -> tuple[Any, str, str, str, str]:
         endpoint = (self._config.get("endpoint") or "").strip()
@@ -120,14 +161,8 @@ class S3StorageProvider(BaseStorageProvider):
         if missing_fields:
             raise StorageError(f"S3 配置缺失：{', '.join(missing_fields)}")
 
-        # 自动规范化 endpoint：
-        # 若用户填写的是 https://{bucket}.s3.bitiful.net 这类含 bucket 子域的地址，
-        # 则剔除 bucket 前缀，还原为根域 https://s3.bitiful.net，
-        # 让 boto3 virtual-hosted 模式自己拼出正确的 {bucket}.s3.bitiful.net
         normalized_endpoint = self._normalize_endpoint(endpoint, bucket)
-
-        logger.debug(f"S3 endpoint (原始): {endpoint}")
-        logger.debug(f"S3 endpoint (规范化): {normalized_endpoint}")
+        logger.debug(f"S3 endpoint 原始={endpoint} 规范化={normalized_endpoint}")
 
         client = boto3.client(
             "s3",
@@ -150,23 +185,20 @@ class S3StorageProvider(BaseStorageProvider):
           https://my-bucket.s3.bitiful.net  ->  https://s3.bitiful.net
           https://my-bucket.s3.amazonaws.com  ->  https://s3.amazonaws.com
           https://s3.bitiful.net  ->  https://s3.bitiful.net  (不变)
-          https://s3.us-east-1.amazonaws.com  ->  https://s3.us-east-1.amazonaws.com  (不变)
         """
         if not endpoint or not bucket:
             return endpoint
 
         parsed = urlparse(endpoint)
         hostname = parsed.hostname or ""
-
-        # 若 hostname 以 "{bucket}." 开头，则剔除该前缀
         bucket_prefix = bucket.lower() + "."
+
         if hostname.lower().startswith(bucket_prefix):
             new_hostname = hostname[len(bucket_prefix):]
-            # 重建 netloc（保留端口信息）
             port = parsed.port
             new_netloc = f"{new_hostname}:{port}" if port else new_hostname
             normalized = parsed._replace(netloc=new_netloc).geturl()
-            logger.debug(f"检测到 endpoint 含 bucket 子域，已自动规范化：{endpoint} -> {normalized}")
+            logger.debug(f"endpoint 含 bucket 子域，已规范化：{endpoint} -> {normalized}")
             return normalized
 
         return endpoint
@@ -177,16 +209,18 @@ class S3StorageProvider(BaseStorageProvider):
         return f"s3://{self._config.get('bucket', '').strip()}/{object_key}"
 
     def _normalize_object_summary(self, bucket: str, item: dict[str, Any], public_base_url: str) -> dict[str, Any]:
-        object_key = str(item.get("Key") or "").strip()
+        raw_key = str(item.get("Key") or "").strip()
+        clean_key = self._strip_bucket_prefix(raw_key, bucket)
         return {
-            "file_id": object_key,
+            "file_id": clean_key,
             "bucket": bucket,
-            "key": object_key,
+            "key": clean_key,
+            "raw_key": raw_key,
             "size": int(item.get("Size") or 0),
             "etag": str(item.get("ETag") or "").strip('"'),
             "last_modified": self._format_datetime(item.get("LastModified")),
             "storage_class": str(item.get("StorageClass") or "STANDARD"),
-            "url": self._build_file_url(object_key, public_base_url),
+            "url": self._build_file_url(clean_key, public_base_url),
         }
 
     def _normalize_head_object(
@@ -214,7 +248,17 @@ class S3StorageProvider(BaseStorageProvider):
         normalized = (file_id or "").strip().lstrip("/")
         if not normalized:
             raise StorageError("fileID 不能为空")
-        return normalized
+        bucket = (self._config.get("bucket") or "").strip().strip("/")
+        return self._strip_bucket_prefix(normalized, bucket)
+
+    def _strip_bucket_prefix(self, key: str, bucket: str) -> str:
+        if bucket:
+            prefix = bucket + "/"
+            if key.startswith(prefix):
+                stripped = key[len(prefix):]
+                if stripped:
+                    return stripped
+        return key
 
     def _format_datetime(self, value: Any) -> str:
         if isinstance(value, datetime):
@@ -224,7 +268,38 @@ class S3StorageProvider(BaseStorageProvider):
         return ""
 
 
-@register("astrbot_plugin_storage_s3", "yunus", "将引用的文件上传到缤纷云 S3 的插件", "1.2.0")
+def sanitize_filename(name: str) -> str:
+    """
+    清理文件名，只保留字母、数字、连字符、下划线和点，其余全部删除。
+
+    示例：
+      "ScreenRecording_03-05-2026 00-34-44_1.MP4"
+      -> "ScreenRecording_03-05-2026_00-34-44_1.MP4"
+
+      "my file (1) [final].mp4"
+      -> "myfile1final.mp4"
+    """
+    stem = Path(name).stem
+    suffix = Path(name).suffix  # 保留原始扩展名，如 .MP4
+
+    # 将空格替换为下划线，再删除所有非安全字符
+    safe_stem = stem.replace(" ", "_")
+    safe_stem = re.sub(r"[^\w\-]", "", safe_stem)  # \w = [a-zA-Z0-9_]
+
+    # 去掉连续的下划线/连字符，保持整洁
+    safe_stem = re.sub(r"[_\-]{2,}", "_", safe_stem)
+    safe_stem = safe_stem.strip("_-")
+
+    # 扩展名只保留字母和数字
+    safe_suffix = re.sub(r"[^a-zA-Z0-9.]", "", suffix)
+
+    if not safe_stem:
+        safe_stem = uuid.uuid4().hex
+
+    return f"{safe_stem}{safe_suffix}"
+
+
+@register("astrbot_plugin_storage_s3", "yunus", "将引用的文件上传到缤纷云 S3 的插件", "1.4.0")
 class StorageS3Plugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -247,8 +322,17 @@ class StorageS3Plugin(Star):
             yield result
 
     @s3.command("detail")
-    async def s3_detail(self, event: AstrMessageEvent, file_id: str):
+    async def s3_detail(self, event: AstrMessageEvent):
+        """用法：/s3 detail <fileID>，fileID 可含路径斜杠"""
+        file_id = self._extract_subcommand_arg(event, "detail")
         async for result in self._handle_detail_command(event, file_id):
+            yield result
+
+    @s3.command("download")
+    async def s3_download(self, event: AstrMessageEvent):
+        """用法：/s3 download <fileID>，fileID 可含路径斜杠"""
+        file_id = self._extract_subcommand_arg(event, "download")
+        async for result in self._handle_download_command(event, file_id):
             yield result
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -260,8 +344,26 @@ class StorageS3Plugin(Star):
         async for result in self._handle_upload_command(event):
             yield result
 
+    def _extract_subcommand_arg(self, event: AstrMessageEvent, subcommand: str) -> str:
+        """
+        从原始消息文本里手动提取子命令后面的完整参数，支持参数中含路径斜杠。
+
+        例如消息 "/s3 download astrbot/uploads/xxx.MP4"
+        框架解析后 file_id 可能被截断，这里从 event.message_str 原始文本里取完整路径。
+        """
+        raw = (event.message_str or "").strip()
+        pattern = re.compile(
+            r"^/?\s*s3\s+" + re.escape(subcommand) + r"\s+(.+)$",
+            re.IGNORECASE,
+        )
+        m = pattern.match(raw)
+        if m:
+            return m.group(1).strip()
+        return ""
+
     async def _handle_upload_command(self, event: AstrMessageEvent):
         """引用文件，使用指令【s3上传】上传到 S3 兼容存储"""
+        yield event.plain_result(f"开始读取文件")
         try:
             provider = self._build_provider()
         except StorageError as exc:
@@ -273,20 +375,26 @@ class StorageS3Plugin(Star):
             yield event.plain_result("s3 上传 失败：未检测到引用消息中的文件或视频")
             return
 
-        yield event.plain_result(f"文件{file_name}读取成功，开始上传..")
+        # 清理文件名，去除空格和特殊字符，避免 URL 编码歧义
+        safe_name = sanitize_filename(file_name)
+        if safe_name != file_name:
+            logger.info(f"文件名已清理：'{file_name}' -> '{safe_name}'")
+
+        yield event.plain_result(f"文件 {file_name} 读取成功，开始上传...")
         temp_file_path = ""
         try:
-            temp_file_path = await self._run_blocking(self._download_reply_file, file_url, file_name)
-            object_key = self._build_object_key(file_name)
-            content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+            temp_file_path = await self._run_blocking(self._download_reply_file, file_url, safe_name)
+            object_key = self._build_object_key(safe_name)
+            content_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
             result = await self._run_blocking(provider.upload_file, temp_file_path, object_key, content_type)
             yield event.plain_result(
-                "s3 上传 上传成功\n"
+                "s3 上传成功\n"
+                f"原始文件名: {file_name}\n"
+                f"存储文件名: {safe_name}\n"
                 f"Provider: {result.get('provider')}\n"
                 f"Bucket: {result.get('bucket')}\n"
-                f"Key: {result.get('key')}\n"
-                f"URL: {result.get('url')}\n"
-                f"文件名: {file_name}"
+                f"fileID: {result.get('key')}\n"
+                f"URL: {result.get('url')}"
             )
         except StorageError as exc:
             yield event.plain_result(f"s3 上传 失败：{exc}")
@@ -330,25 +438,24 @@ class StorageS3Plugin(Star):
         ]
         if prefix:
             lines.append(f"Prefix: {prefix}")
-        lines.append("文件列表：")
+        lines.append("文件列表（使用 /s3 detail <ID> 或 /s3 download <ID> 操作）：")
         for index, item in enumerate(files, start=1):
-            lines.extend(
-                [
-                    f"{index}. ID: {item.get('file_id')}",
-                    f"   Key: {item.get('key')}",
-                    f"   Size: {item.get('size')} bytes",
-                    f"   LastModified: {item.get('last_modified')}",
-                    f"   URL: {item.get('url')}",
-                ]
-            )
+            size_mb = item.get("size", 0) / 1024 / 1024
+            lines.extend([
+                f"{index}. ID(下载用这个): {item.get('file_id')}",
+                f"   Size: {size_mb:.2f} MB",
+                f"   LastModified: {item.get('last_modified')}",
+                f"   URL: {item.get('url')}",
+            ])
         yield event.plain_result("\n".join(lines))
 
     async def _handle_detail_command(self, event: AstrMessageEvent, file_id: str):
         normalized_file_id = (file_id or "").strip()
         if not normalized_file_id:
-            yield event.plain_result("s3 detail 失败：请使用指令 /s3 detail {fileID}")
+            yield event.plain_result("s3 detail 失败：请使用指令 /s3 detail <fileID>")
             return
 
+        logger.info(f"[detail] 收到 file_id='{normalized_file_id}'")
         try:
             provider = self._build_provider()
             detail = await self._run_blocking(provider.get_file_detail, normalized_file_id)
@@ -364,7 +471,7 @@ class StorageS3Plugin(Star):
             "s3 detail 成功",
             f"Bucket: {detail.get('bucket')}",
             f"FileID: {detail.get('file_id')}",
-            f"Key: {detail.get('key')}",
+            f"fileID: {detail.get('key')}",
             f"Size: {detail.get('size')} bytes",
             f"ContentType: {detail.get('content_type')}",
             f"ETag: {detail.get('etag')}",
@@ -378,6 +485,50 @@ class StorageS3Plugin(Star):
             for key, value in metadata.items():
                 lines.append(f"  {key}: {value}")
         yield event.plain_result("\n".join(lines))
+
+    async def _handle_download_command(self, event: AstrMessageEvent, file_id: str):
+        normalized_file_id = (file_id or "").strip()
+        if not normalized_file_id:
+            yield event.plain_result("s3 download 失败：请使用指令 /s3 download <fileID>")
+            return
+
+        logger.info(f"[download] 收到 file_id='{normalized_file_id}'")
+        try:
+            provider = self._build_provider()
+            result = await self._run_blocking(provider.get_download_url, normalized_file_id)
+        except StorageError as exc:
+            yield event.plain_result(f"s3 download 失败：{exc}")
+            return
+        except Exception as exc:
+            logger.exception("s3 download 处理异常", exc_info=exc)
+            yield event.plain_result(f"s3 download 异常：{exc}")
+            return
+
+        download_url = result.get("download_url") or ""
+        expires_in = result.get("expires_in")
+
+        info_lines = [
+            "s3 download 文件信息: ",
+            f"Bucket: {result.get('bucket')}",
+            f"fileID: {result.get('key')}",
+            f"URL: {download_url}",
+        ]
+        if expires_in:
+            info_lines.append(f"有效期: {expires_in} 秒（预签名链接）")
+        yield event.plain_result("\n".join(info_lines))
+
+        yield event.plain_result(f"获取链接开始下载视频...")
+
+        if not download_url:
+            yield event.plain_result("s3 download 失败：未生成有效的下载链接")
+            return
+
+        logger.info(f"[download] 发送视频 URL: {download_url}")
+        try:
+            yield event.chain_result([Video.fromURL(url=download_url)])
+        except Exception as exc:
+            logger.warning(f"发送视频消息失败，降级为文本链接：{exc}")
+            yield event.plain_result(f"视频发送失败，请手动访问下载链接：\n{download_url}")
 
     def _build_provider(self) -> BaseStorageProvider:
         if self.provider_name == "s3":
@@ -507,7 +658,9 @@ class StorageS3Plugin(Star):
         return None
 
     def _build_object_key(self, file_name: str) -> str:
+        """构建 object key，file_name 此时已经过 sanitize_filename 清理。"""
         key_prefix = str(self.s3_config.get("key_prefix") or "").strip().strip("/")
+        # 不再额外处理文件名，sanitize_filename 已保证安全
         safe_name = Path(file_name).name or f"upload-{uuid.uuid4().hex}"
         unique_name = f"{uuid.uuid4().hex}_{safe_name}"
         return f"{key_prefix}/{unique_name}" if key_prefix else unique_name
