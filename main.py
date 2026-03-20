@@ -94,19 +94,20 @@ class StorageS3Plugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
+        """引用文件，使用指令【s3上传】上传到缤纷云 S3"""
         message_str = (event.message_str or "").strip()
-        if message_str != "s3 upload":
+        if message_str != "s3上传":
             return
 
         try:
             provider = self._build_provider()
         except StorageError as exc:
-            yield event.plain_result(f"s3 upload 失败：{exc}")
+            yield event.plain_result(f"s3 上传 失败：{exc}")
             return
 
         file_url, file_name = await self._extract_reply_file(event)
         if not file_url or not file_name:
-            yield event.plain_result("s3 upload 失败：未检测到引用消息中的文件或视频")
+            yield event.plain_result("s3 上传 失败：未检测到引用消息中的文件或视频")
             return
 
         yield event.plain_result(f"文件{file_name}读取成功，开始上传..")
@@ -117,7 +118,7 @@ class StorageS3Plugin(Star):
             content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
             result = await self._run_blocking(provider.upload_file, temp_file_path, object_key, content_type)
             yield event.plain_result(
-                "s3 upload 上传成功\n"
+                "s3 上传 上传成功\n"
                 f"Provider: {result.get('provider')}\n"
                 f"Bucket: {result.get('bucket')}\n"
                 f"Key: {result.get('key')}\n"
@@ -125,10 +126,10 @@ class StorageS3Plugin(Star):
                 f"文件名: {file_name}"
             )
         except StorageError as exc:
-            yield event.plain_result(f"s3 upload 失败：{exc}")
+            yield event.plain_result(f"s3 上传 失败：{exc}")
         except Exception as exc:
-            logger.exception("s3 upload 处理异常", exc_info=exc)
-            yield event.plain_result(f"s3 upload 异常：{exc}")
+            logger.exception("s3 上传 处理异常", exc_info=exc)
+            yield event.plain_result(f"s3 上传 异常：{exc}")
         finally:
             if temp_file_path:
                 try:
@@ -150,7 +151,7 @@ class StorageS3Plugin(Star):
         for component in components:
             reply_components = await self._pick_reply_components(component)
             if reply_components:
-                url, name = self._extract_file_from_components(reply_components)
+                url, name = await self._extract_file_from_components(reply_components)
                 if url and name:
                     return url, name
         return None, None
@@ -190,53 +191,53 @@ class StorageS3Plugin(Star):
                         return value
         return None
 
-    def _extract_file_from_components(self, components: Any) -> tuple[str | None, str | None]:
+    async def _extract_file_from_components(self, components: Any) -> tuple[str | None, str | None]:
         items = components if isinstance(components, list) else [components]
         for item in items:
             item_type = str(getattr(item, "type", "") or "").lower()
-            if item_type in {"video", "file", "image", "record", "componenttype.file", "componenttype.video", "componenttype.image", "componenttype.record"}:
-                file_url = self._pick_first_str(
-                    item,
-                    "file",
-                    "file_",
-                    "url",
-                    "file_url",
-                    "src",
-                    "path",
-                )
-                file_name = self._pick_first_str(
-                    item,
-                    "name",
-                    "file_name",
-                    "filename",
-                )
+            FILE_TYPES = {
+                "video", "file", "image", "record",
+                "componenttype.file", "componenttype.video",
+                "componenttype.image", "componenttype.record",
+            }
+
+            if item_type in FILE_TYPES:
+                # 优先使用异步 get_file()
+                file_url = None
+                file_name = None
+
+                get_file = getattr(item, "get_file", None)
+                if callable(get_file):
+                    try:
+                        file_obj = await get_file()
+                        if file_obj:
+                            file_url = getattr(file_obj, "url", None) or getattr(file_obj, "file_url", None)
+                            file_name = getattr(file_obj, "name", None) or getattr(file_obj, "file_name", None)
+                    except Exception as exc:
+                        logger.debug(f"await get_file() 失败：{exc}")
+
+                # 回退：读取非 file 的其他安全属性（排除 .file 避免触发同步下载）
+                if not file_url:
+                    file_url = self._pick_first_str(item, "url", "file_url", "src", "path")
+                if not file_name:
+                    file_name = self._pick_first_str(item, "name", "file_name", "filename")
+
                 if not file_name and file_url:
                     file_name = Path(file_url.split("?")[0]).name
                 if file_url and file_name:
                     return file_url, file_name
 
+            # 处理 data dict 的情况（data dict 里没有异步问题）
             nested_data = getattr(item, "data", None)
             if isinstance(nested_data, dict):
-                file_url = self._pick_first_dict_str(
-                    nested_data,
-                    "file",
-                    "file_",
-                    "url",
-                    "file_url",
-                    "src",
-                    "path",
-                )
-                file_name = self._pick_first_dict_str(
-                    nested_data,
-                    "name",
-                    "file_name",
-                    "filename",
-                )
                 nested_type = str(nested_data.get("type", item_type) or "").lower()
-                if nested_type in {"video", "file", "image", "record", "componenttype.file", "componenttype.video", "componenttype.image", "componenttype.record"} and file_url:
+                file_url = self._pick_first_dict_str(nested_data, "file", "file_", "url", "file_url", "src", "path")
+                file_name = self._pick_first_dict_str(nested_data, "name", "file_name", "filename")
+                if nested_type in FILE_TYPES and file_url:
                     if not file_name:
                         file_name = Path(file_url.split("?")[0]).name
                     return file_url, file_name
+
         return None, None
 
 
