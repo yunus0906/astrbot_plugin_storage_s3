@@ -9,16 +9,16 @@
   },
   "s3": {
     "type": "object",
-    "description": "S3 兼容存储配置。当前可用于缤纷云 S3。",
+    "description": "S3 兼容存储配置。当前可用于 Amazon S3、缤纷云 S3 等。",
     "items": {
       "endpoint": {
         "type": "string",
-        "description": "S3 Endpoint，例如 https://s3.bitiful.net",
+        "description": "S3 Endpoint，例如 https://s3.bitiful.net 或 https://s3.amazonaws.com",
         "default": "https://s3.bitiful.net"
       },
       "region": {
         "type": "string",
-        "description": "S3 Region，例如 cn-east-1",
+        "description": "S3 Region，例如 cn-east-1、ap-southeast-1",
         "default": "cn-east-1"
       },
       "access_key_id": {
@@ -35,17 +35,27 @@
       },
       "public_base_url": {
         "type": "string",
-        "description": "可选。上传成功后拼接出的文件访问前缀，例如 https://your-bucket.bitiful.net",
+        "description": "可选。用于返回文件访问链接前缀，例如 https://your-bucket.s3.amazonaws.com",
         "default": ""
       },
       "key_prefix": {
         "type": "string",
-        "description": "可选。对象 Key 前缀，例如 astrbot/uploads",
+        "description": "可选。上传对象 Key 前缀，例如 astrbot/uploads",
         "default": "astrbot/uploads"
       },
       "acl": {
         "type": "string",
-        "description": "可选。对象 ACL，例如 private、public-read。留空则不传。",
+        "description": "可选。上传对象 ACL，例如 private、public-read。留空则不传。",
+        "default": ""
+      },
+      "list_max_keys": {
+        "type": "int",
+        "description": "可选。/s3 list 单次返回的最大文件数量，范围 1-100。",
+        "default": 20
+      },
+      "list_prefix": {
+        "type": "string",
+        "description": "可选。/s3 list 默认查询的对象 Key 前缀。",
         "default": ""
       }
     }
