@@ -1,0 +1,53 @@
+{
+  "provider": {
+    "type": "string",
+    "description": "云存储提供商。当前支持 s3，后续可扩展 qiniu、cos 等。",
+    "default": "s3",
+    "enum": [
+      "s3"
+    ]
+  },
+  "s3": {
+    "type": "object",
+    "description": "S3 兼容存储配置。当前可用于缤纷云 S3。",
+    "items": {
+      "endpoint": {
+        "type": "string",
+        "description": "S3 Endpoint，例如 https://s3.bitiful.net",
+        "default": "https://s3.bitiful.net"
+      },
+      "region": {
+        "type": "string",
+        "description": "S3 Region，例如 cn-east-1",
+        "default": "cn-east-1"
+      },
+      "access_key_id": {
+        "type": "string",
+        "description": "Access Key ID"
+      },
+      "secret_access_key": {
+        "type": "string",
+        "description": "Secret Access Key"
+      },
+      "bucket": {
+        "type": "string",
+        "description": "目标 Bucket 名称"
+      },
+      "public_base_url": {
+        "type": "string",
+        "description": "可选。上传成功后拼接出的文件访问前缀，例如 https://your-bucket.bitiful.net",
+        "default": ""
+      },
+      "key_prefix": {
+        "type": "string",
+        "description": "可选。对象 Key 前缀，例如 astrbot/uploads",
+        "default": "astrbot/uploads"
+      },
+      "acl": {
+        "type": "string",
+        "description": "可选。对象 ACL，例如 private、public-read。留空则不传。",
+        "default": ""
+      }
+    }
+  }
+}
